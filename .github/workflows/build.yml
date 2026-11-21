@@ -1,0 +1,57 @@
+name: Build
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2025
+    env:
+      RAITEI_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up vcpkg
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "vcpkg"
+          $binaries = Join-Path $env:RUNNER_TEMP "vcpkg-binaries"
+          git clone --depth 1 https://github.com/microsoft/vcpkg $root
+          & "$root\bootstrap-vcpkg.bat" -disableMetrics
+          New-Item -ItemType Directory -Force $binaries | Out-Null
+          "VCPKG_ROOT=$root" >> $env:GITHUB_ENV
+          "VCPKG_DEFAULT_BINARY_CACHE=$binaries" >> $env:GITHUB_ENV
+
+      - name: Restore vcpkg binaries
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}\vcpkg-binaries
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: vcpkg-${{ runner.os }}-
+
+      - name: Build
+        shell: cmd
+        run: build.bat
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: raitei
+          path: |
+            build/raitei.dll
+            build/raitei.pdb
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$env:GITHUB_REF_NAME" build/raitei.dll build/raitei.pdb --title "Raitei $env:GITHUB_REF_NAME" --generate-notes
