@@ -25,6 +25,15 @@ rtc::binary to_binary(std::span<const std::uint8_t> bytes) {
     return result;
 }
 
+bool send_binary(rtc::DataChannel& channel, std::span<const std::uint8_t> bytes) {
+    try {
+        return channel.send(to_binary(bytes));
+    } catch (const std::exception& error) {
+        spdlog::warn("send on {} failed, the link is closing: {}", channel.label(), error.what());
+        return false;
+    }
+}
+
 std::vector<std::uint8_t> to_bytes(const rtc::binary& bytes) {
     std::vector<std::uint8_t> result(bytes.size());
     std::memcpy(result.data(), bytes.data(), bytes.size());
@@ -70,7 +79,7 @@ struct Tunnel::Peer {
     LinkState state = LinkState::connecting;
 };
 
-Tunnel::Tunnel(SignalingClient& signaling) : signaling_(signaling), thread_([this](std::stop_token stop) { run(stop); }) {
+Tunnel::Tunnel(SignalingLink& signaling) : signaling_(signaling), thread_([this](std::stop_token stop) { run(stop); }) {
     signaling_.on_message([this](Message message) {
         std::scoped_lock lock(mutex_);
         inbox_.push_back(std::move(message));
@@ -78,7 +87,39 @@ Tunnel::Tunnel(SignalingClient& signaling) : signaling_(signaling), thread_([thi
     });
 }
 
-std::shared_ptr<rtc::PeerConnection> Tunnel::open_connection(const std::shared_ptr<Peer>& peer, MessageType description_type, const rtc::Configuration& configuration) {
+Tunnel::~Tunnel() {
+    thread_.request_stop();
+    thread_.join();
+    signaling_.on_message(nullptr);
+
+    std::vector<std::shared_ptr<Peer>> peers;
+    {
+        std::scoped_lock lock(mutex_);
+        peers = std::exchange(host_peers_, {});
+        for (const auto& [socket, peer] : sockets_) {
+            peers.push_back(peer);
+        }
+        if (client_) {
+            peers.push_back(client_);
+        }
+        sockets_.clear();
+        ready_.clear();
+        client_.reset();
+    }
+    for (const auto& peer : peers) {
+        for (const auto& channel : {peer->stream, peer->datagrams}) {
+            if (channel) {
+                channel->resetCallbacks();
+            }
+        }
+        if (peer->connection) {
+            peer->connection->resetCallbacks();
+            peer->connection->close();
+        }
+    }
+}
+
+std::shared_ptr<rtc::PeerConnection> Tunnel::open_connection(const std::shared_ptr<Peer>& peer, const rtc::Configuration& configuration) {
     auto connection = std::make_shared<rtc::PeerConnection>(configuration);
     {
         std::scoped_lock lock(mutex_);
@@ -86,24 +127,27 @@ std::shared_ptr<rtc::PeerConnection> Tunnel::open_connection(const std::shared_p
     }
 
     const std::weak_ptr<Peer> weak = peer;
-    connection->onGatheringStateChange([this, weak, description_type](rtc::PeerConnection::GatheringState state) {
-        if (state != rtc::PeerConnection::GatheringState::Complete) {
-            return;
-        }
+    connection->onLocalDescription([this, weak](rtc::Description description) {
         const auto locked = weak.lock();
         if (!locked) {
             return;
         }
-        const auto description = locked->connection->localDescription();
-        if (!description) {
-            return;
-        }
         const auto to = format_address(locked->remote);
-        const auto kind = description_type == MessageType::offer ? "offer" : "answer";
-        if (signaling_.send(description_type, to, std::string(*description))) {
+        const bool offer = description.type() == rtc::Description::Type::Offer;
+        const auto kind = offer ? "offer" : "answer";
+        if (signaling_.send(offer ? MessageType::offer : MessageType::answer, to, std::string(description))) {
             spdlog::info("sent {} to {}", kind, to);
         } else {
             spdlog::warn("could not send {} to {}: signaling is not connected", kind, to);
+        }
+    });
+    connection->onLocalCandidate([this, weak](rtc::Candidate candidate) {
+        const auto locked = weak.lock();
+        if (!locked) {
+            return;
+        }
+        if (!signaling_.send_candidate(format_address(locked->remote), std::string(candidate), candidate.mid())) {
+            spdlog::warn("could not send a candidate to {}: signaling is not connected", format_address(locked->remote));
         }
     });
     connection->onStateChange([this, weak](rtc::PeerConnection::State state) {
@@ -121,29 +165,38 @@ void Tunnel::open_client() {
     std::shared_ptr<Peer> peer;
     {
         std::scoped_lock lock(mutex_);
-        if (!client_ || client_->connection) {
+        if (!client_waiting_for_connection()) {
             return;
         }
         peer = client_;
     }
 
-    const auto connection = open_connection(peer, MessageType::offer, peer_configuration(signaling_.ice_servers()));
-    {
-        std::scoped_lock lock(mutex_);
-        if (client_ != peer) {
-            peer.reset();
+    try {
+        const auto connection = open_connection(peer, peer_configuration(signaling_.ice_servers()));
+        {
+            std::scoped_lock lock(mutex_);
+            if (client_ != peer) {
+                peer.reset();
+            }
         }
-    }
-    if (!peer) {
-        connection->close();
-        return;
-    }
+        if (!peer) {
+            connection->close();
+            return;
+        }
 
-    rtc::DataChannelInit unreliable;
-    unreliable.reliability.unordered = true;
-    unreliable.reliability.maxRetransmits = 0;
-    attach_stream(peer, connection->createDataChannel(std::string(stream_label)), false);
-    attach_datagrams(peer, connection->createDataChannel(std::string(datagram_label), unreliable));
+        rtc::DataChannelInit unreliable;
+        unreliable.reliability.unordered = true;
+        unreliable.reliability.maxRetransmits = 0;
+        attach_stream(peer, connection->createDataChannel(std::string(stream_label)), false);
+        attach_datagrams(peer, connection->createDataChannel(std::string(datagram_label), unreliable));
+    } catch (const std::exception& error) {
+        spdlog::warn("opening the link to {} failed: {}", format_address(peer->remote), error.what());
+        mark_closed(peer);
+    }
+}
+
+bool Tunnel::client_waiting_for_connection() const {
+    return client_ && !client_->connection && client_->state != LinkState::closed;
 }
 
 void Tunnel::attach_stream(const std::shared_ptr<Peer>& peer, const std::shared_ptr<rtc::DataChannel>& channel, bool accepted_by_host) {
@@ -362,7 +415,7 @@ bool Tunnel::send_datagram(std::uint32_t to, std::span<const std::uint8_t> datag
         }
         return false;
     }
-    return channel->send(to_binary(datagram));
+    return send_binary(*channel, datagram);
 }
 
 std::optional<Datagram> Tunnel::receive_datagram() {
@@ -385,7 +438,7 @@ void Tunnel::answer(std::uint32_t remote, const std::string& sdp) {
 
     auto peer = std::make_shared<Peer>();
     peer->remote = remote;
-    const auto connection = open_connection(peer, MessageType::answer, peer_configuration(signaling_.ice_servers()));
+    const auto connection = open_connection(peer, peer_configuration(signaling_.ice_servers()));
     const std::weak_ptr<Peer> weak = peer;
     connection->onDataChannel([this, weak](std::shared_ptr<rtc::DataChannel> channel) {
         const auto locked = weak.lock();
@@ -425,6 +478,10 @@ void Tunnel::handle(const Message& message) {
         answer(*remote, message.sdp);
         return;
     }
+    if (message.type == MessageType::candidate) {
+        add_remote_candidate(*remote, message);
+        return;
+    }
 
     std::shared_ptr<rtc::PeerConnection> connection;
     {
@@ -437,6 +494,24 @@ void Tunnel::handle(const Message& message) {
     }
     spdlog::info("answer from {}", message.from);
     connection->setRemoteDescription(rtc::Description(message.sdp, rtc::Description::Type::Answer));
+}
+
+void Tunnel::add_remote_candidate(std::uint32_t remote, const Message& message) {
+    std::shared_ptr<rtc::PeerConnection> connection;
+    {
+        std::scoped_lock lock(mutex_);
+        if (client_ && client_->remote == remote && client_answered_) {
+            connection = client_->connection;
+        }
+        for (const auto& peer : host_peers_) {
+            if (peer->remote == remote) {
+                connection = peer->connection;
+            }
+        }
+    }
+    if (connection) {
+        connection->addRemoteCandidate(rtc::Candidate(message.candidate, message.mid));
+    }
 }
 
 Received Tunnel::take_frame(Peer& peer) {
@@ -452,7 +527,7 @@ Received Tunnel::take_frame(Peer& peer) {
 }
 
 bool Tunnel::send_stream(const Peer& peer, std::span<const std::uint8_t> frame) {
-    return peer.stream && peer.stream->isOpen() && peer.stream->send(to_binary(frame));
+    return peer.stream && peer.stream->isOpen() && send_binary(*peer.stream, frame);
 }
 
 void Tunnel::close_all(std::vector<std::shared_ptr<Peer>> peers) {
@@ -466,7 +541,7 @@ void Tunnel::close_all(std::vector<std::shared_ptr<Peer>> peers) {
 void Tunnel::run(std::stop_token stop) {
     std::unique_lock lock(mutex_);
     while (!stop.stop_requested()) {
-        if (!wake_.wait(lock, stop, [this] { return !inbox_.empty() || (client_ && !client_->connection); })) {
+        if (!wake_.wait(lock, stop, [this] { return !inbox_.empty() || client_waiting_for_connection(); })) {
             break;
         }
 
@@ -475,7 +550,11 @@ void Tunnel::run(std::stop_token stop) {
 
         open_client();
         for (const auto& message : messages) {
-            handle(message);
+            try {
+                handle(message);
+            } catch (const std::exception& error) {
+                spdlog::warn("signaling message from {} failed: {}", message.from, error.what());
+            }
         }
 
         lock.lock();

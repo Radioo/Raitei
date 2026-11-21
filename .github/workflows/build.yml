@@ -56,6 +56,10 @@ jobs:
           path: ${{ runner.temp }}\vcpkg-binaries
           key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}-${{ github.run_id }}-${{ github.run_attempt }}
 
+      - name: Test
+        shell: pwsh
+        run: ctest --preset release
+
       - name: Upload build
         uses: actions/upload-artifact@v4
         with:

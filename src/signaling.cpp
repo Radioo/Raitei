@@ -4,6 +4,7 @@
 #include <rtc/rtc.hpp>
 #include <spdlog/spdlog.h>
 
+#include <limits>
 #include <string_view>
 #include <utility>
 #include <variant>
@@ -21,6 +22,21 @@ constexpr std::string_view welcome_type = "welcome";
 constexpr std::string_view offer_type = "offer";
 constexpr std::string_view answer_type = "answer";
 constexpr std::string_view ice_type = "ice";
+constexpr std::string_view candidate_type = "candidate";
+
+std::string string_field(const nlohmann::json& frame, const char* name) {
+    const auto found = frame.find(name);
+    return found != frame.end() && found->is_string() ? found->get<std::string>() : std::string{};
+}
+
+std::uint16_t port_field(const nlohmann::json& frame, const char* name) {
+    const auto found = frame.find(name);
+    if (found == frame.end() || !found->is_number_unsigned()) {
+        return 0;
+    }
+    const auto value = found->get<std::uint64_t>();
+    return value <= std::numeric_limits<std::uint16_t>::max() ? static_cast<std::uint16_t>(value) : 0;
+}
 
 std::string_view type_name(MessageType type) {
     return type == MessageType::offer ? offer_type : answer_type;
@@ -38,8 +54,8 @@ std::vector<IceServer> parse_ice_servers(const nlohmann::json& list) {
                 server.urls.push_back(url.get<std::string>());
             }
         }
-        server.username = item.value("username", std::string{});
-        server.credential = item.value("credential", std::string{});
+        server.username = string_field(item, "username");
+        server.credential = string_field(item, "credential");
         servers.push_back(std::move(server));
     }
     return servers;
@@ -48,6 +64,21 @@ std::vector<IceServer> parse_ice_servers(const nlohmann::json& list) {
 }
 
 SignalingClient::SignalingClient() : thread_([this](std::stop_token stop) { run(stop); }) {
+}
+
+SignalingClient::~SignalingClient() {
+    thread_.request_stop();
+    thread_.join();
+    std::shared_ptr<rtc::WebSocket> socket;
+    {
+        std::scoped_lock lock(mutex_);
+        socket = std::exchange(socket_, nullptr);
+        ++generation_;
+    }
+    if (socket) {
+        socket->resetCallbacks();
+        socket->close();
+    }
 }
 
 void SignalingClient::connect(std::string url) {
@@ -75,6 +106,10 @@ bool SignalingClient::send(MessageType type, const std::string& to, const std::s
     return send_frame({{"type", type_name(type)}, {"to", to}, {"sdp", sdp}});
 }
 
+bool SignalingClient::send_candidate(const std::string& to, const std::string& candidate, const std::string& mid) {
+    return send_frame({{"type", candidate_type}, {"to", to}, {"candidate", candidate}, {"mid", mid}});
+}
+
 std::optional<std::vector<IceServer>> SignalingClient::ice_servers() {
     std::scoped_lock call(ice_call_);
     {
@@ -100,7 +135,15 @@ bool SignalingClient::send_frame(const nlohmann::json& frame) {
         std::scoped_lock lock(mutex_);
         socket = socket_;
     }
-    return socket && socket->isOpen() && socket->send(frame.dump());
+    if (!socket || !socket->isOpen()) {
+        return false;
+    }
+    try {
+        return socket->send(frame.dump());
+    } catch (const std::exception& error) {
+        spdlog::warn("signaling send failed: {}", error.what());
+        return false;
+    }
 }
 
 void SignalingClient::run(std::stop_token stop) {
@@ -191,10 +234,14 @@ void SignalingClient::receive(const std::string& text) {
 
     if (type == welcome_type) {
         Registration registration{
-            .address = frame.value("address", std::string{}),
-            .token = frame.value("token", std::string{}),
-            .port = frame.value("port", std::uint16_t{0}),
+            .address = string_field(frame, "address"),
+            .token = string_field(frame, "token"),
+            .port = port_field(frame, "port"),
         };
+        if (registration.address.empty() || registration.token.empty()) {
+            spdlog::warn("ignoring a welcome without an address and token");
+            return;
+        }
         std::scoped_lock lock(mutex_);
         if (!registration_ || registration_->address != registration.address) {
             spdlog::info("registered as {}", registration.address);
@@ -208,7 +255,8 @@ void SignalingClient::receive(const std::string& text) {
         if (frame.contains("servers") && frame["servers"].is_array()) {
             servers = parse_ice_servers(frame["servers"]);
         } else {
-            spdlog::warn("ice servers unavailable: {}", frame.value("error", std::string{"no reason given"}));
+            const auto reason = string_field(frame, "error");
+            spdlog::warn("ice servers unavailable: {}", reason.empty() ? "no reason given" : reason);
         }
         std::scoped_lock lock(mutex_);
         ice_reply_ = std::move(servers);
@@ -216,7 +264,15 @@ void SignalingClient::receive(const std::string& text) {
         return;
     }
 
-    if (type != offer_type && type != answer_type) {
+    Message message{.type = MessageType::offer, .from = string_field(frame, "from")};
+    if (type == offer_type || type == answer_type) {
+        message.type = type == offer_type ? MessageType::offer : MessageType::answer;
+        message.sdp = string_field(frame, "sdp");
+    } else if (type == candidate_type) {
+        message.type = MessageType::candidate;
+        message.candidate = string_field(frame, "candidate");
+        message.mid = string_field(frame, "mid");
+    } else {
         return;
     }
     MessageHandler handler;
@@ -225,11 +281,7 @@ void SignalingClient::receive(const std::string& text) {
         handler = handler_;
     }
     if (handler) {
-        handler(Message{
-            .type = type == offer_type ? MessageType::offer : MessageType::answer,
-            .from = frame.value("from", std::string{}),
-            .sdp = frame.value("sdp", std::string{}),
-        });
+        handler(std::move(message));
     }
 }
 

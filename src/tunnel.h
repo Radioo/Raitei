@@ -48,7 +48,10 @@ struct Datagram {
 
 class Tunnel {
 public:
-    explicit Tunnel(SignalingClient& signaling);
+    explicit Tunnel(SignalingLink& signaling);
+    Tunnel(const Tunnel&) = delete;
+    Tunnel& operator=(const Tunnel&) = delete;
+    ~Tunnel();
 
     void start_accepting();
     void stop_accepting();
@@ -71,19 +74,21 @@ public:
 private:
     struct Peer;
 
-    std::shared_ptr<rtc::PeerConnection> open_connection(const std::shared_ptr<Peer>& peer, MessageType description_type, const rtc::Configuration& configuration);
+    std::shared_ptr<rtc::PeerConnection> open_connection(const std::shared_ptr<Peer>& peer, const rtc::Configuration& configuration);
     void open_client();
+    bool client_waiting_for_connection() const;
     void attach_stream(const std::shared_ptr<Peer>& peer, const std::shared_ptr<rtc::DataChannel>& channel, bool accepted_by_host);
     void attach_datagrams(const std::shared_ptr<Peer>& peer, const std::shared_ptr<rtc::DataChannel>& channel);
     void mark_closed(const std::shared_ptr<Peer>& peer);
     void answer(std::uint32_t remote, const std::string& sdp);
     void handle(const Message& message);
+    void add_remote_candidate(std::uint32_t remote, const Message& message);
     static Received take_frame(Peer& peer);
     static bool send_stream(const Peer& peer, std::span<const std::uint8_t> frame);
     static void close_all(std::vector<std::shared_ptr<Peer>> peers);
     void run(std::stop_token stop);
 
-    SignalingClient& signaling_;
+    SignalingLink& signaling_;
     mutable std::mutex mutex_;
     std::condition_variable_any wake_;
     bool accepting_ = false;

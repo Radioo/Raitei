@@ -39,25 +39,43 @@ find_package(LibDataChannel CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(safetyhook CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
+find_package(Catch2 3 CONFIG REQUIRED)
 
-add_library(raitei SHARED
-    src/dllmain.cpp
+add_library(raitei_core STATIC
     src/ess_hooks.cpp
+    src/frames.cpp
     src/ipv4.cpp
     src/module_scan.cpp
     src/services_hook.cpp
     src/signaling.cpp
     src/tunnel.cpp
-    "${CMAKE_BINARY_DIR}/version.rc"
 )
-
-target_compile_definitions(raitei PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX RAITEI_VERSION="${RAITEI_VERSION}")
-target_compile_options(raitei PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4 /utf-8 /permissive->)
-
-target_link_libraries(raitei PRIVATE
+target_include_directories(raitei_core PUBLIC src)
+target_compile_definitions(raitei_core PUBLIC WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(raitei_core PUBLIC $<$<COMPILE_LANGUAGE:CXX>:/W4 /utf-8 /permissive->)
+target_link_libraries(raitei_core PUBLIC
     LibDataChannel::LibDataChannel
     nlohmann_json::nlohmann_json
     safetyhook::safetyhook
     spdlog::spdlog
     ws2_32
 )
+
+add_library(raitei SHARED
+    src/dllmain.cpp
+    "${CMAKE_BINARY_DIR}/version.rc"
+)
+target_compile_definitions(raitei PRIVATE RAITEI_VERSION="${RAITEI_VERSION}")
+target_link_libraries(raitei PRIVATE raitei_core)
+
+enable_testing()
+add_executable(raitei_tests
+    tests/frames_test.cpp
+    tests/ipv4_test.cpp
+    tests/signaling_test.cpp
+    tests/tunnel_test.cpp
+    tests/loopback_signaling.cpp
+)
+target_link_libraries(raitei_tests PRIVATE raitei_core Catch2::Catch2WithMain)
+include(Catch)
+catch_discover_tests(raitei_tests DISCOVERY_MODE PRE_TEST)

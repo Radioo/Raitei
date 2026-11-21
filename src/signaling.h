@@ -28,6 +28,7 @@ struct Registration {
 enum class MessageType {
     offer,
     answer,
+    candidate,
 };
 
 struct IceServer {
@@ -40,19 +41,36 @@ struct Message {
     MessageType type;
     std::string from;
     std::string sdp;
+    std::string candidate;
+    std::string mid;
 };
 
-class SignalingClient {
+class SignalingLink {
 public:
     using MessageHandler = std::function<void(Message)>;
 
+    SignalingLink() = default;
+    SignalingLink(const SignalingLink&) = delete;
+    SignalingLink& operator=(const SignalingLink&) = delete;
+    virtual ~SignalingLink() = default;
+
+    virtual void on_message(MessageHandler handler) = 0;
+    virtual bool send(MessageType type, const std::string& to, const std::string& sdp) = 0;
+    virtual bool send_candidate(const std::string& to, const std::string& candidate, const std::string& mid) = 0;
+    virtual std::optional<std::vector<IceServer>> ice_servers() = 0;
+};
+
+class SignalingClient final : public SignalingLink {
+public:
     SignalingClient();
+    ~SignalingClient() override;
 
     void connect(std::string url);
-    void on_message(MessageHandler handler);
+    void on_message(MessageHandler handler) override;
     std::optional<Registration> registration() const;
-    bool send(MessageType type, const std::string& to, const std::string& sdp);
-    std::optional<std::vector<IceServer>> ice_servers();
+    bool send(MessageType type, const std::string& to, const std::string& sdp) override;
+    bool send_candidate(const std::string& to, const std::string& candidate, const std::string& mid) override;
+    std::optional<std::vector<IceServer>> ice_servers() override;
 
 private:
     void run(std::stop_token stop);
