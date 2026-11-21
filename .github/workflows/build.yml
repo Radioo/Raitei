@@ -14,32 +14,47 @@ jobs:
     runs-on: windows-2025
     env:
       RAITEI_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+      BUILD_ATTEMPTS: 3
+      RETRY_DELAY_SECONDS: 60
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Set up vcpkg
+      - name: Set up the vcpkg binary cache
         shell: pwsh
         run: |
-          $root = Join-Path $env:RUNNER_TEMP "vcpkg"
           $binaries = Join-Path $env:RUNNER_TEMP "vcpkg-binaries"
-          git clone --depth 1 https://github.com/microsoft/vcpkg $root
-          & "$root\bootstrap-vcpkg.bat" -disableMetrics
           New-Item -ItemType Directory -Force $binaries | Out-Null
-          "VCPKG_ROOT=$root" >> $env:GITHUB_ENV
           "VCPKG_DEFAULT_BINARY_CACHE=$binaries" >> $env:GITHUB_ENV
 
       - name: Restore vcpkg binaries
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}\vcpkg-binaries
-          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
-          restore-keys: vcpkg-${{ runner.os }}-
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}-
+            vcpkg-${{ runner.os }}-
 
       - name: Build
-        shell: cmd
-        run: build.bat
+        shell: pwsh
+        run: |
+          for ($attempt = 1; $attempt -le $env:BUILD_ATTEMPTS; $attempt++) {
+            & .\build.bat
+            if ($LASTEXITCODE -eq 0) { exit 0 }
+            Write-Host "::warning::build attempt $attempt failed"
+            Remove-Item -Recurse -Force build -ErrorAction SilentlyContinue
+            if ($attempt -lt $env:BUILD_ATTEMPTS) { Start-Sleep -Seconds $env:RETRY_DELAY_SECONDS }
+          }
+          exit 1
+
+      - name: Save vcpkg binaries
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}\vcpkg-binaries
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Upload build
         uses: actions/upload-artifact@v4
