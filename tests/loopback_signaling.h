@@ -1,6 +1,6 @@
 #pragma once
 
-#include "signaling.h"
+#include "core/signaling.h"
 
 #include <chrono>
 #include <functional>
@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace raitei::testing {
 
@@ -20,8 +21,8 @@ public:
         Endpoint(LoopbackSignaling& hub, std::string address, std::vector<IceServer> servers);
 
         void on_message(MessageHandler handler) override;
-        bool send(MessageType type, const std::string& to, const std::string& sdp) override;
-        bool send_candidate(const std::string& to, const std::string& candidate, const std::string& mid) override;
+        bool send(MessageType type, const std::string& to, const std::string& link, const std::string& sdp) override;
+        bool send_candidate(const std::string& to, const std::string& link, const std::string& candidate, const std::string& mid, bool from_offerer) override;
         std::optional<std::vector<IceServer>> ice_servers() override;
 
         void deliver(Message message);
@@ -37,12 +38,14 @@ public:
 
     Endpoint& join(const std::string& address, std::vector<IceServer> servers = {});
     void inject(const std::string& to, Message message);
+    std::vector<Message> delivered_to(const std::string& address);
 
 private:
     bool route(const std::string& to, Message message);
 
     std::mutex mutex_;
     std::map<std::string, std::unique_ptr<Endpoint>> endpoints_;
+    std::map<std::string, std::vector<Message>> delivered_;
 };
 
 }

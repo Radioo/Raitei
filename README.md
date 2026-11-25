@@ -9,7 +9,9 @@ ICE tries a direct connection first and falls back to a TURN relay when the NATs
 allow one. The matching server pairs the cabinets, relays the WebRTC signaling between them and hands
 out short-lived TURN credentials.
 
-Supported: SOUND VOLTEX 7 (NABLA) online matching.
+Supported: 
+- SOUND VOLTEX 7 and up
+- beatmania IIDX 25 and up
 
 ## Run
 

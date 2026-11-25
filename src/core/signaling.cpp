@@ -23,6 +23,8 @@ constexpr std::string_view offer_type = "offer";
 constexpr std::string_view answer_type = "answer";
 constexpr std::string_view ice_type = "ice";
 constexpr std::string_view candidate_type = "candidate";
+constexpr const char* offerer_field = "offerer";
+constexpr const char* link_field = "link";
 
 std::string string_field(const nlohmann::json& frame, const char* name) {
     const auto found = frame.find(name);
@@ -36,6 +38,14 @@ std::uint16_t port_field(const nlohmann::json& frame, const char* name) {
     }
     const auto value = found->get<std::uint64_t>();
     return value <= std::numeric_limits<std::uint16_t>::max() ? static_cast<std::uint16_t>(value) : 0;
+}
+
+std::optional<bool> bool_field(const nlohmann::json& frame, const char* name) {
+    const auto found = frame.find(name);
+    if (found == frame.end() || !found->is_boolean()) {
+        return std::nullopt;
+    }
+    return found->get<bool>();
 }
 
 std::string_view type_name(MessageType type) {
@@ -97,17 +107,22 @@ void SignalingClient::on_message(MessageHandler handler) {
     handler_ = std::move(handler);
 }
 
+bool SignalingClient::configured() const {
+    std::scoped_lock lock(mutex_);
+    return !url_.empty();
+}
+
 std::optional<Registration> SignalingClient::registration() const {
     std::scoped_lock lock(mutex_);
     return registration_;
 }
 
-bool SignalingClient::send(MessageType type, const std::string& to, const std::string& sdp) {
-    return send_frame({{"type", type_name(type)}, {"to", to}, {"sdp", sdp}});
+bool SignalingClient::send(MessageType type, const std::string& to, const std::string& link, const std::string& sdp) {
+    return send_frame({{"type", type_name(type)}, {"to", to}, {link_field, link}, {"sdp", sdp}});
 }
 
-bool SignalingClient::send_candidate(const std::string& to, const std::string& candidate, const std::string& mid) {
-    return send_frame({{"type", candidate_type}, {"to", to}, {"candidate", candidate}, {"mid", mid}});
+bool SignalingClient::send_candidate(const std::string& to, const std::string& link, const std::string& candidate, const std::string& mid, bool from_offerer) {
+    return send_frame({{"type", candidate_type}, {"to", to}, {link_field, link}, {"candidate", candidate}, {"mid", mid}, {offerer_field, from_offerer}});
 }
 
 std::optional<std::vector<IceServer>> SignalingClient::ice_servers() {
@@ -264,7 +279,7 @@ void SignalingClient::receive(const std::string& text) {
         return;
     }
 
-    Message message{.type = MessageType::offer, .from = string_field(frame, "from")};
+    Message message{.type = MessageType::offer, .from = string_field(frame, "from"), .link = string_field(frame, link_field)};
     if (type == offer_type || type == answer_type) {
         message.type = type == offer_type ? MessageType::offer : MessageType::answer;
         message.sdp = string_field(frame, "sdp");
@@ -272,6 +287,7 @@ void SignalingClient::receive(const std::string& text) {
         message.type = MessageType::candidate;
         message.candidate = string_field(frame, "candidate");
         message.mid = string_field(frame, "mid");
+        message.from_offerer = bool_field(frame, offerer_field);
     } else {
         return;
     }

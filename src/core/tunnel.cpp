@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <bit>
 #include <cstring>
+#include <format>
 #include <string_view>
 #include <utility>
 #include <variant>
@@ -27,7 +28,8 @@ rtc::binary to_binary(std::span<const std::uint8_t> bytes) {
 
 bool send_binary(rtc::DataChannel& channel, std::span<const std::uint8_t> bytes) {
     try {
-        return channel.send(to_binary(bytes));
+        channel.send(to_binary(bytes));
+        return true;
     } catch (const std::exception& error) {
         spdlog::warn("send on {} failed, the link is closing: {}", channel.label(), error.what());
         return false;
@@ -72,6 +74,9 @@ rtc::Configuration peer_configuration(const std::optional<std::vector<IceServer>
 
 struct Tunnel::Peer {
     std::uint32_t remote = 0;
+    std::string link;
+    bool offerer = false;
+    bool answered = false;
     std::shared_ptr<rtc::PeerConnection> connection;
     std::shared_ptr<rtc::DataChannel> stream;
     std::shared_ptr<rtc::DataChannel> datagrams;
@@ -79,7 +84,7 @@ struct Tunnel::Peer {
     LinkState state = LinkState::connecting;
 };
 
-Tunnel::Tunnel(SignalingLink& signaling) : signaling_(signaling), thread_([this](std::stop_token stop) { run(stop); }) {
+Tunnel::Tunnel(SignalingLink& signaling) : signaling_(signaling), link_ids_(std::random_device{}()), thread_([this](std::stop_token stop) { run(stop); }) {
     signaling_.on_message([this](Message message) {
         std::scoped_lock lock(mutex_);
         inbox_.push_back(std::move(message));
@@ -95,16 +100,15 @@ Tunnel::~Tunnel() {
     std::vector<std::shared_ptr<Peer>> peers;
     {
         std::scoped_lock lock(mutex_);
-        peers = std::exchange(host_peers_, {});
-        for (const auto& [socket, peer] : sockets_) {
+        peers = std::exchange(incoming_, {});
+        peers.insert(peers.end(), released_.begin(), released_.end());
+        released_.clear();
+        for (const auto& [handle, peer] : handles_) {
             peers.push_back(peer);
         }
-        if (client_) {
-            peers.push_back(client_);
-        }
-        sockets_.clear();
+        handles_.clear();
         ready_.clear();
-        client_.reset();
+        unopened_.clear();
     }
     for (const auto& peer : peers) {
         for (const auto& channel : {peer->stream, peer->datagrams}) {
@@ -135,7 +139,7 @@ std::shared_ptr<rtc::PeerConnection> Tunnel::open_connection(const std::shared_p
         const auto to = format_address(locked->remote);
         const bool offer = description.type() == rtc::Description::Type::Offer;
         const auto kind = offer ? "offer" : "answer";
-        if (signaling_.send(offer ? MessageType::offer : MessageType::answer, to, std::string(description))) {
+        if (signaling_.send(offer ? MessageType::offer : MessageType::answer, to, locked->link, std::string(description))) {
             spdlog::info("sent {} to {}", kind, to);
         } else {
             spdlog::warn("could not send {} to {}: signaling is not connected", kind, to);
@@ -146,7 +150,7 @@ std::shared_ptr<rtc::PeerConnection> Tunnel::open_connection(const std::shared_p
         if (!locked) {
             return;
         }
-        if (!signaling_.send_candidate(format_address(locked->remote), std::string(candidate), candidate.mid())) {
+        if (!signaling_.send_candidate(format_address(locked->remote), locked->link, std::string(candidate), candidate.mid(), locked->offerer)) {
             spdlog::warn("could not send a candidate to {}: signaling is not connected", format_address(locked->remote));
         }
     });
@@ -161,25 +165,18 @@ std::shared_ptr<rtc::PeerConnection> Tunnel::open_connection(const std::shared_p
     return connection;
 }
 
-void Tunnel::open_client() {
-    std::shared_ptr<Peer> peer;
-    {
+void Tunnel::open_outgoing(const std::shared_ptr<Peer>& peer) {
+    const auto wanted = [this, &peer] {
         std::scoped_lock lock(mutex_);
-        if (!client_waiting_for_connection()) {
-            return;
-        }
-        peer = client_;
+        return std::ranges::any_of(handles_, [&peer](const auto& entry) { return entry.second == peer; });
+    };
+    if (!wanted()) {
+        return;
     }
 
     try {
         const auto connection = open_connection(peer, peer_configuration(signaling_.ice_servers()));
-        {
-            std::scoped_lock lock(mutex_);
-            if (client_ != peer) {
-                peer.reset();
-            }
-        }
-        if (!peer) {
+        if (!wanted()) {
             connection->close();
             return;
         }
@@ -187,7 +184,7 @@ void Tunnel::open_client() {
         rtc::DataChannelInit unreliable;
         unreliable.reliability.unordered = true;
         unreliable.reliability.maxRetransmits = 0;
-        attach_stream(peer, connection->createDataChannel(std::string(stream_label)), false);
+        attach_stream(peer, connection->createDataChannel(std::string(stream_label)));
         attach_datagrams(peer, connection->createDataChannel(std::string(datagram_label), unreliable));
     } catch (const std::exception& error) {
         spdlog::warn("opening the link to {} failed: {}", format_address(peer->remote), error.what());
@@ -195,13 +192,9 @@ void Tunnel::open_client() {
     }
 }
 
-bool Tunnel::client_waiting_for_connection() const {
-    return client_ && !client_->connection && client_->state != LinkState::closed;
-}
-
-void Tunnel::attach_stream(const std::shared_ptr<Peer>& peer, const std::shared_ptr<rtc::DataChannel>& channel, bool accepted_by_host) {
+void Tunnel::attach_stream(const std::shared_ptr<Peer>& peer, const std::shared_ptr<rtc::DataChannel>& channel) {
     const std::weak_ptr<Peer> weak = peer;
-    const auto opened = [this, weak, accepted_by_host] {
+    const auto opened = [this, weak] {
         const auto locked = weak.lock();
         if (!locked) {
             return;
@@ -212,7 +205,7 @@ void Tunnel::attach_stream(const std::shared_ptr<Peer>& peer, const std::shared_
         }
         locked->state = LinkState::open;
         spdlog::info("link to {} is open", format_address(locked->remote));
-        if (accepted_by_host) {
+        if (!locked->offerer) {
             ready_.push_back(locked);
         }
     };
@@ -266,6 +259,11 @@ void Tunnel::mark_closed(const std::shared_ptr<Peer>& peer) {
     peer->state = LinkState::closed;
     spdlog::info("link to {} closed", format_address(peer->remote));
     std::erase(ready_, peer);
+    const bool accepted = std::ranges::any_of(handles_, [&peer](const auto& entry) { return entry.second == peer; });
+    if (!accepted && std::erase(incoming_, peer) != 0) {
+        released_.push_back(peer);
+        wake_.notify_all();
+    }
 }
 
 void Tunnel::start_accepting() {
@@ -279,139 +277,129 @@ void Tunnel::stop_accepting() {
     {
         std::scoped_lock lock(mutex_);
         accepting_ = false;
-        closing = std::exchange(host_peers_, {});
+        closing = std::exchange(incoming_, {});
         ready_.clear();
-        sockets_.clear();
+        std::erase_if(handles_, [](const auto& entry) { return !entry.second->offerer; });
     }
-    spdlog::info("game stopped accepting, closing {} host links", closing.size());
-    close_all(std::move(closing));
+    spdlog::info("game stopped accepting, closing {} incoming links", closing.size());
+    close_all(closing);
 }
 
-bool Tunnel::accept_into(int socket) {
+bool Tunnel::has_ready() const {
+    std::scoped_lock lock(mutex_);
+    return !ready_.empty();
+}
+
+bool Tunnel::accept_into(int handle) {
     std::scoped_lock lock(mutex_);
     if (ready_.empty()) {
         return false;
     }
-    sockets_[socket] = ready_.front();
+    const auto peer = ready_.front();
     ready_.pop_front();
-    spdlog::info("accepted {} as socket {}", format_address(sockets_[socket]->remote), socket);
+    handles_[handle] = peer;
+    spdlog::info("accepted {} as {}", format_address(peer->remote), handle);
     return true;
 }
 
-bool Tunnel::owns_socket(int socket) const {
+void Tunnel::connect(int handle, std::uint32_t remote) {
+    close(handle);
+
+    auto peer = std::make_shared<Peer>();
+    peer->remote = remote;
+    peer->offerer = true;
+    spdlog::info("connecting to {} as {}", format_address(remote), handle);
+
     std::scoped_lock lock(mutex_);
-    return sockets_.contains(socket);
+    peer->link = std::format("{:016x}", link_ids_());
+    handles_[handle] = peer;
+    unopened_.push_back(peer);
+    wake_.notify_all();
 }
 
-bool Tunnel::send_on_socket(int socket, std::span<const std::uint8_t> frame) {
-    std::shared_ptr<Peer> peer;
+bool Tunnel::owns(int handle) const {
+    std::scoped_lock lock(mutex_);
+    return handles_.contains(handle);
+}
+
+std::optional<std::uint32_t> Tunnel::remote(int handle) const {
+    std::scoped_lock lock(mutex_);
+    const auto found = handles_.find(handle);
+    if (found == handles_.end()) {
+        return std::nullopt;
+    }
+    return found->second->remote;
+}
+
+LinkState Tunnel::state(int handle) const {
+    std::scoped_lock lock(mutex_);
+    const auto found = handles_.find(handle);
+    return found == handles_.end() ? LinkState::closed : found->second->state;
+}
+
+bool Tunnel::send(int handle, std::span<const std::uint8_t> frame) {
+    std::shared_ptr<rtc::DataChannel> stream;
     {
         std::scoped_lock lock(mutex_);
-        const auto found = sockets_.find(socket);
-        if (found == sockets_.end()) {
+        const auto found = handles_.find(handle);
+        if (found == handles_.end()) {
             return false;
         }
-        peer = found->second;
+        stream = found->second->stream;
     }
-    return send_stream(*peer, frame);
+    return stream && stream->isOpen() && send_binary(*stream, frame);
 }
 
-Received Tunnel::receive_on_socket(int socket) {
+Received Tunnel::receive(int handle) {
     std::scoped_lock lock(mutex_);
-    const auto found = sockets_.find(socket);
-    if (found == sockets_.end()) {
+    const auto found = handles_.find(handle);
+    if (found == handles_.end()) {
         return Received{Received::Status::closed, {}};
     }
     return take_frame(*found->second);
 }
 
-void Tunnel::close_socket(int socket) {
+void Tunnel::close(int handle) {
     std::shared_ptr<Peer> peer;
     {
         std::scoped_lock lock(mutex_);
-        const auto found = sockets_.find(socket);
-        if (found == sockets_.end()) {
+        const auto found = handles_.find(handle);
+        if (found == handles_.end()) {
             return;
         }
         peer = found->second;
-        sockets_.erase(found);
-        std::erase(host_peers_, peer);
+        handles_.erase(found);
+        std::erase(incoming_, peer);
+        std::erase(unopened_, peer);
     }
-    spdlog::info("game closed socket {} to {}", socket, format_address(peer->remote));
+    spdlog::info("game closed {} to {}", handle, format_address(peer->remote));
     close_all({peer});
-}
-
-void Tunnel::connect(std::uint32_t remote) {
-    disconnect_client();
-
-    auto peer = std::make_shared<Peer>();
-    peer->remote = remote;
-    spdlog::info("connecting to {}", format_address(remote));
-
-    std::scoped_lock lock(mutex_);
-    client_ = peer;
-    client_answered_ = false;
-    wake_.notify_all();
-}
-
-std::optional<std::uint32_t> Tunnel::client_remote() const {
-    std::scoped_lock lock(mutex_);
-    if (!client_) {
-        return std::nullopt;
-    }
-    return client_->remote;
-}
-
-LinkState Tunnel::client_state() const {
-    std::scoped_lock lock(mutex_);
-    return client_ ? client_->state : LinkState::closed;
-}
-
-bool Tunnel::send_on_client(std::span<const std::uint8_t> frame) {
-    std::shared_ptr<Peer> peer;
-    {
-        std::scoped_lock lock(mutex_);
-        peer = client_;
-    }
-    return peer && send_stream(*peer, frame);
-}
-
-Received Tunnel::receive_on_client() {
-    std::scoped_lock lock(mutex_);
-    if (!client_) {
-        return Received{Received::Status::closed, {}};
-    }
-    return take_frame(*client_);
-}
-
-void Tunnel::disconnect_client() {
-    std::shared_ptr<Peer> peer;
-    {
-        std::scoped_lock lock(mutex_);
-        peer = std::exchange(client_, nullptr);
-    }
-    if (peer) {
-        spdlog::info("game disconnected its client link to {}", format_address(peer->remote));
-        close_all({peer});
-    }
 }
 
 bool Tunnel::send_datagram(std::uint32_t to, std::span<const std::uint8_t> datagram) {
     std::shared_ptr<rtc::DataChannel> channel;
+    bool linked = false;
     {
         std::scoped_lock lock(mutex_);
-        if (client_ && client_->remote == to) {
-            channel = client_->datagrams;
-        }
-        for (const auto& [socket, peer] : sockets_) {
-            if (peer->remote == to) {
+        const auto consider = [&](const std::shared_ptr<Peer>& peer) {
+            if (peer->remote != to) {
+                return;
+            }
+            linked = true;
+            if (peer->datagrams && peer->datagrams->isOpen()) {
                 channel = peer->datagrams;
             }
+        };
+        for (const auto& [handle, peer] : handles_) {
+            consider(peer);
+        }
+        for (const auto& peer : incoming_) {
+            consider(peer);
         }
     }
-    if (!channel || !channel->isOpen()) {
+    if (!channel) {
         if (std::has_single_bit(++dropped_datagrams_)) {
-            spdlog::warn("datagram to {} dropped: {} ({} dropped so far)", format_address(to), channel ? "channel not open" : "no link to that address", dropped_datagrams_.load());
+            spdlog::warn("datagram to {} dropped: {} ({} dropped so far)", format_address(to), linked ? "channel not open" : "no link to that address", dropped_datagrams_.load());
         }
         return false;
     }
@@ -428,7 +416,7 @@ std::optional<Datagram> Tunnel::receive_datagram() {
     return datagram;
 }
 
-void Tunnel::answer(std::uint32_t remote, const std::string& sdp) {
+void Tunnel::answer(std::uint32_t remote, const std::string& link, const std::string& sdp) {
     {
         std::scoped_lock lock(mutex_);
         if (!accepting_) {
@@ -438,6 +426,7 @@ void Tunnel::answer(std::uint32_t remote, const std::string& sdp) {
 
     auto peer = std::make_shared<Peer>();
     peer->remote = remote;
+    peer->link = link;
     const auto connection = open_connection(peer, peer_configuration(signaling_.ice_servers()));
     const std::weak_ptr<Peer> weak = peer;
     connection->onDataChannel([this, weak](std::shared_ptr<rtc::DataChannel> channel) {
@@ -446,7 +435,7 @@ void Tunnel::answer(std::uint32_t remote, const std::string& sdp) {
             return;
         }
         if (channel->label() == stream_label) {
-            attach_stream(locked, channel, true);
+            attach_stream(locked, channel);
         } else if (channel->label() == datagram_label) {
             attach_datagrams(locked, channel);
         }
@@ -455,7 +444,7 @@ void Tunnel::answer(std::uint32_t remote, const std::string& sdp) {
     {
         std::scoped_lock lock(mutex_);
         if (accepting_) {
-            host_peers_.push_back(peer);
+            incoming_.push_back(peer);
         } else {
             peer.reset();
         }
@@ -468,45 +457,71 @@ void Tunnel::answer(std::uint32_t remote, const std::string& sdp) {
     connection->setRemoteDescription(rtc::Description(sdp, rtc::Description::Type::Offer));
 }
 
-void Tunnel::handle(const Message& message) {
-    const auto remote = parse_address(message.from);
-    if (!remote) {
-        return;
-    }
-
-    if (message.type == MessageType::offer) {
-        answer(*remote, message.sdp);
-        return;
-    }
-    if (message.type == MessageType::candidate) {
-        add_remote_candidate(*remote, message);
-        return;
-    }
-
+void Tunnel::accept_answer(std::uint32_t remote, const std::string& link, const std::string& sdp) {
     std::shared_ptr<rtc::PeerConnection> connection;
     {
         std::scoped_lock lock(mutex_);
-        if (!client_ || !client_->connection || client_->remote != *remote || client_answered_) {
-            return;
+        const auto peer = outgoing_link(remote, link);
+        if (peer && peer->connection && !peer->answered) {
+            peer->answered = true;
+            connection = peer->connection;
         }
-        client_answered_ = true;
-        connection = client_->connection;
     }
-    spdlog::info("answer from {}", message.from);
-    connection->setRemoteDescription(rtc::Description(message.sdp, rtc::Description::Type::Answer));
+    if (!connection) {
+        return;
+    }
+    spdlog::info("answer from {}", format_address(remote));
+    connection->setRemoteDescription(rtc::Description(sdp, rtc::Description::Type::Answer));
+}
+
+void Tunnel::handle(const Message& message) {
+    const auto remote = parse_address(message.from);
+    if (!remote || message.link.empty()) {
+        return;
+    }
+
+    switch (message.type) {
+    case MessageType::offer:
+        answer(*remote, message.link, message.sdp);
+        break;
+    case MessageType::answer:
+        accept_answer(*remote, message.link, message.sdp);
+        break;
+    case MessageType::candidate:
+        add_remote_candidate(*remote, message);
+        break;
+    }
+}
+
+std::shared_ptr<Tunnel::Peer> Tunnel::incoming_link(std::uint32_t remote, const std::string& link) const {
+    const auto found = std::ranges::find_if(incoming_, [&](const auto& peer) { return peer->remote == remote && peer->link == link; });
+    return found == incoming_.end() ? nullptr : *found;
+}
+
+std::shared_ptr<Tunnel::Peer> Tunnel::outgoing_link(std::uint32_t remote, const std::string& link) const {
+    const auto found = std::ranges::find_if(handles_, [&](const auto& entry) {
+        const auto& peer = entry.second;
+        return peer->offerer && peer->remote == remote && peer->link == link;
+    });
+    return found == handles_.end() ? nullptr : found->second;
 }
 
 void Tunnel::add_remote_candidate(std::uint32_t remote, const Message& message) {
     std::shared_ptr<rtc::PeerConnection> connection;
     {
         std::scoped_lock lock(mutex_);
-        if (client_ && client_->remote == remote && client_answered_) {
-            connection = client_->connection;
+        std::shared_ptr<Peer> peer;
+        if (message.from_offerer != false) {
+            peer = incoming_link(remote, message.link);
         }
-        for (const auto& peer : host_peers_) {
-            if (peer->remote == remote) {
-                connection = peer->connection;
+        if (!peer && message.from_offerer != true) {
+            peer = outgoing_link(remote, message.link);
+            if (peer && !peer->answered) {
+                peer.reset();
             }
+        }
+        if (peer) {
+            connection = peer->connection;
         }
     }
     if (connection) {
@@ -526,29 +541,38 @@ Received Tunnel::take_frame(Peer& peer) {
     return Received{Received::Status::empty, {}};
 }
 
-bool Tunnel::send_stream(const Peer& peer, std::span<const std::uint8_t> frame) {
-    return peer.stream && peer.stream->isOpen() && send_binary(*peer.stream, frame);
-}
-
-void Tunnel::close_all(std::vector<std::shared_ptr<Peer>> peers) {
-    for (const auto& peer : peers) {
-        if (peer->connection) {
-            peer->connection->close();
+void Tunnel::close_all(const std::vector<std::shared_ptr<Peer>>& peers) {
+    std::vector<std::shared_ptr<rtc::PeerConnection>> connections;
+    {
+        std::scoped_lock lock(mutex_);
+        for (const auto& peer : peers) {
+            if (peer->connection) {
+                connections.push_back(peer->connection);
+            }
         }
+    }
+    for (const auto& connection : connections) {
+        connection->close();
     }
 }
 
 void Tunnel::run(std::stop_token stop) {
     std::unique_lock lock(mutex_);
     while (!stop.stop_requested()) {
-        if (!wake_.wait(lock, stop, [this] { return !inbox_.empty() || client_waiting_for_connection(); })) {
+        if (!wake_.wait(lock, stop, [this] { return !inbox_.empty() || !unopened_.empty() || !released_.empty(); })) {
             break;
         }
 
         auto messages = std::exchange(inbox_, {});
+        auto opening = std::exchange(unopened_, {});
+        const std::vector released(released_.begin(), released_.end());
+        released_.clear();
         lock.unlock();
 
-        open_client();
+        close_all(released);
+        for (const auto& peer : opening) {
+            open_outgoing(peer);
+        }
         for (const auto& message : messages) {
             try {
                 handle(message);

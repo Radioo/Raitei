@@ -1,13 +1,15 @@
 #include "ess_hooks.h"
 
 #include "frames.h"
-#include "ipv4.h"
+
+#include "core/ipv4.h"
 
 #include <windows.h>
 
 #include <safetyhook.hpp>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstring>
@@ -18,8 +20,6 @@
 namespace raitei {
 
 namespace {
-
-constexpr std::wstring_view ess_module = L"ess.dll";
 
 constexpr int client_socket = -1;
 constexpr int sent = 0;
@@ -110,18 +110,18 @@ int connect_request(std::uint32_t ip, std::uint16_t port) {
     }
     client_session_key = session_key(ip);
     connect_reported = false;
-    tunnel->connect(ip);
+    tunnel->connect(client_socket, ip);
     return requested;
 }
 
 int connect_wait(int* result) {
-    if (!tunnel->client_remote()) {
+    if (!tunnel->owns(client_socket)) {
         return hooks.connect_wait.call<int>(result);
     }
     if (connect_reported) {
         return no_connect_in_progress;
     }
-    switch (tunnel->client_state()) {
+    switch (tunnel->state(client_socket)) {
     case LinkState::connecting:
         return connect_pending;
     case LinkState::open:
@@ -136,29 +136,23 @@ int connect_wait(int* result) {
 }
 
 int tcp_sendto(int socket, const std::uint8_t* frame, int length) {
-    const std::span bytes(frame, static_cast<std::size_t>(length));
-    if (socket == client_socket && tunnel->client_remote()) {
-        return tunnel->send_on_client(bytes) ? sent : send_failed;
-    }
-    if (tunnel->owns_socket(socket)) {
-        return tunnel->send_on_socket(socket, bytes) ? sent : send_failed;
+    if (tunnel->owns(socket)) {
+        return tunnel->send(socket, std::span(frame, static_cast<std::size_t>(length))) ? sent : send_failed;
     }
     return hooks.tcp_sendto.call<int>(socket, frame, length);
 }
 
 int tcp_recvfrom(int socket, std::uint8_t* buffer, int capacity, int fourth, int fifth) {
-    if (socket == client_socket && tunnel->client_remote()) {
-        return deliver(tunnel->receive_on_client(), buffer, capacity, client_session_key);
-    }
-    if (tunnel->owns_socket(socket)) {
-        return deliver(tunnel->receive_on_socket(socket), buffer, capacity, host_session_key);
+    if (tunnel->owns(socket)) {
+        const auto key = socket == client_socket ? client_session_key.load() : host_session_key.load();
+        return deliver(tunnel->receive(socket), buffer, capacity, key);
     }
     return hooks.tcp_recvfrom.call<int>(socket, buffer, capacity, fourth, fifth);
 }
 
 int close_dstsocket(int socket) {
-    if (tunnel->owns_socket(socket)) {
-        tunnel->close_socket(socket);
+    if (tunnel->owns(socket)) {
+        tunnel->close(socket);
         return 0;
     }
     return hooks.close_dstsocket.call<int>(socket);
@@ -171,8 +165,8 @@ int close_dstsocket_all() {
 }
 
 int client_disconnect() {
-    if (tunnel->client_remote()) {
-        tunnel->disconnect_client();
+    if (tunnel->owns(client_socket)) {
+        tunnel->close(client_socket);
         return 0;
     }
     return hooks.client_disconnect.call<int>();
@@ -211,8 +205,7 @@ int udp_recvfrom(std::uint8_t* buffer, int capacity, std::uint32_t* ip, std::uin
         return hooks.udp_recvfrom.call<int>(buffer, capacity, ip, port, fifth, sixth);
     }
 
-    const auto client = tunnel->client_remote();
-    const auto key = client && *client == datagram->from ? client_session_key.load() : host_session_key.load();
+    const auto key = tunnel->remote(client_socket) == datagram->from ? client_session_key.load() : host_session_key.load();
     *ip = datagram->from;
     *port = 0;
     return deliver(Received{Received::Status::frame, datagram->bytes}, buffer, capacity, key);
@@ -235,12 +228,7 @@ bool hook(HMODULE ess, const char* name, safetyhook::InlineHook& slot, void* det
 
 }
 
-bool install_ess_hooks(Tunnel& target_tunnel, const SignalingClient& target_signaling) {
-    const HMODULE ess = GetModuleHandleW(ess_module.data());
-    if (ess == nullptr) {
-        spdlog::error("ess.dll is not loaded");
-        return false;
-    }
+bool install_ess_hooks(HMODULE ess, Tunnel& target_tunnel, SignalingClient& target_signaling) {
     tunnel = &target_tunnel;
     signaling = &target_signaling;
 

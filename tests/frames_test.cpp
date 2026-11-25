@@ -1,5 +1,5 @@
-#include "frames.h"
-#include "ipv4.h"
+#include "games/sdvx/frames.h"
+#include "core/ipv4.h"
 
 #include <catch2/catch_test_macros.hpp>
 

@@ -37,25 +37,33 @@ configure_file(src/version.rc.in "${CMAKE_BINARY_DIR}/version.rc" @ONLY)
 
 find_package(LibDataChannel CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
+find_path(DETOURS_INCLUDE_DIR detours/detours.h REQUIRED)
+find_library(DETOURS_LIBRARY detours REQUIRED)
 find_package(safetyhook CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
 find_package(Catch2 3 CONFIG REQUIRED)
 
 add_library(raitei_core STATIC
-    src/ess_hooks.cpp
-    src/frames.cpp
-    src/ipv4.cpp
-    src/module_scan.cpp
-    src/services_hook.cpp
-    src/signaling.cpp
-    src/tunnel.cpp
+    src/core/import_table.cpp
+    src/core/ipv4.cpp
+    src/core/module_scan.cpp
+    src/core/services_hook.cpp
+    src/core/signaling.cpp
+    src/core/tunnel.cpp
+    src/games/games.cpp
+    src/games/iidx/address_queries.cpp
+    src/games/iidx/iidx_hooks.cpp
+    src/games/iidx/virtual_network.cpp
+    src/games/sdvx/ess_hooks.cpp
+    src/games/sdvx/frames.cpp
 )
-target_include_directories(raitei_core PUBLIC src)
+target_include_directories(raitei_core PUBLIC src ${DETOURS_INCLUDE_DIR})
 target_compile_definitions(raitei_core PUBLIC WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_options(raitei_core PUBLIC $<$<COMPILE_LANGUAGE:CXX>:/W4 /utf-8 /permissive->)
 target_link_libraries(raitei_core PUBLIC
     LibDataChannel::LibDataChannel
     nlohmann_json::nlohmann_json
+    ${DETOURS_LIBRARY}
     safetyhook::safetyhook
     spdlog::spdlog
     ws2_32
@@ -70,10 +78,12 @@ target_link_libraries(raitei PRIVATE raitei_core)
 
 enable_testing()
 add_executable(raitei_tests
+    tests/address_queries_test.cpp
     tests/frames_test.cpp
     tests/ipv4_test.cpp
     tests/signaling_test.cpp
     tests/tunnel_test.cpp
+    tests/virtual_network_test.cpp
     tests/loopback_signaling.cpp
 )
 target_link_libraries(raitei_tests PRIVATE raitei_core Catch2::Catch2WithMain)

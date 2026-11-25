@@ -3,6 +3,7 @@
   "version-string": "0.1.0",
   "dependencies": [
     "catch2",
+    "detours",
     {
       "name": "libdatachannel",
       "default-features": false,

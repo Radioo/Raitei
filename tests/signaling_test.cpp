@@ -1,5 +1,5 @@
 #include "loopback_signaling.h"
-#include "signaling.h"
+#include "core/signaling.h"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -167,23 +167,63 @@ TEST_CASE("offers, answers and candidates from the switchboard reach the handler
     client.connect(switchboard.url());
     REQUIRE(eventually([&] { return registered(client); }));
 
-    REQUIRE(switchboard.send(R"({"type":"offer","from":"100.64.0.5","sdp":"v=0 offer"})"));
+    REQUIRE(switchboard.send(R"({"type":"offer","from":"100.64.0.5","link":"00000000000000d4","sdp":"v=0 offer"})"));
     REQUIRE(switchboard.send(R"({"type":"answer","from":"100.64.0.6","sdp":"v=0 answer"})"));
     REQUIRE(switchboard.send(R"({"type":"candidate","from":"100.64.0.6","candidate":"a=candidate:1 1 UDP 1 10.20.30.40 5000 typ host","mid":"0"})"));
+    REQUIRE(switchboard.send(R"({"type":"candidate","from":"100.64.0.6","candidate":"c","mid":"0","offerer":true})"));
+    REQUIRE(switchboard.send(R"({"type":"candidate","from":"100.64.0.6","candidate":"c","mid":"0","offerer":false})"));
 
     REQUIRE(eventually([&] {
         std::scoped_lock lock(mutex);
-        return messages.size() == 3;
+        return messages.size() == 5;
     }));
     std::scoped_lock lock(mutex);
     CHECK(messages[0].type == MessageType::offer);
     CHECK(messages[0].from == "100.64.0.5");
     CHECK(messages[0].sdp == "v=0 offer");
+    CHECK(messages[0].link == "00000000000000d4");
+    CHECK(messages[1].link.empty());
     CHECK(messages[1].type == MessageType::answer);
     CHECK(messages[1].from == "100.64.0.6");
     CHECK(messages[2].type == MessageType::candidate);
     CHECK(messages[2].candidate == "a=candidate:1 1 UDP 1 10.20.30.40 5000 typ host");
     CHECK(messages[2].mid == "0");
+    CHECK_FALSE(messages[2].from_offerer.has_value());
+    CHECK(messages[3].from_offerer == true);
+    CHECK(messages[4].from_offerer == false);
+}
+
+TEST_CASE("candidates say which side of the link sent them") {
+    SwitchboardStandIn switchboard;
+    std::mutex mutex;
+    std::vector<nlohmann::json> candidates;
+    switchboard.reply([&](const nlohmann::json& frame) -> std::optional<nlohmann::json> {
+        if (frame.value("type", "") == "candidate") {
+            std::scoped_lock lock(mutex);
+            candidates.push_back(frame);
+            return std::nullopt;
+        }
+        return welcome(frame);
+    });
+    SignalingClient client;
+    CHECK_FALSE(client.configured());
+    client.connect(switchboard.url());
+    CHECK(client.configured());
+    REQUIRE(eventually([&] { return registered(client); }));
+
+    REQUIRE(client.send_candidate("100.64.0.5", "00000000000000a1", "a", "0", true));
+    REQUIRE(client.send_candidate("100.64.0.5", "00000000000000b2", "b", "0", false));
+
+    REQUIRE(eventually([&] {
+        std::scoped_lock lock(mutex);
+        return candidates.size() == 2;
+    }));
+    std::scoped_lock lock(mutex);
+    CHECK(candidates[0].value("offerer", false) == true);
+    CHECK(candidates[1].value("offerer", true) == false);
+    CHECK(candidates[1].value("to", "") == "100.64.0.5");
+    CHECK(candidates[0].value("link", "") == "00000000000000a1");
+    CHECK(candidates[1].value("link", "") == "00000000000000b2");
 }
 
 TEST_CASE("frames the client cannot use are ignored without losing the connection") {
@@ -253,7 +293,7 @@ TEST_CASE("without a connection sends fail and there are no ice servers") {
     SignalingClient client;
 
     const auto started = std::chrono::steady_clock::now();
-    CHECK_FALSE(client.send(MessageType::offer, "100.64.0.5", "v=0"));
+    CHECK_FALSE(client.send(MessageType::offer, "100.64.0.5", "00000000000000c3", "v=0"));
     CHECK_FALSE(client.ice_servers());
     CHECK(std::chrono::steady_clock::now() - started < prompt_reply);
     CHECK_FALSE(client.registration());

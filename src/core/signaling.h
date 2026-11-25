@@ -40,9 +40,11 @@ struct IceServer {
 struct Message {
     MessageType type;
     std::string from;
+    std::string link;
     std::string sdp;
     std::string candidate;
     std::string mid;
+    std::optional<bool> from_offerer;
 };
 
 class SignalingLink {
@@ -55,8 +57,8 @@ public:
     virtual ~SignalingLink() = default;
 
     virtual void on_message(MessageHandler handler) = 0;
-    virtual bool send(MessageType type, const std::string& to, const std::string& sdp) = 0;
-    virtual bool send_candidate(const std::string& to, const std::string& candidate, const std::string& mid) = 0;
+    virtual bool send(MessageType type, const std::string& to, const std::string& link, const std::string& sdp) = 0;
+    virtual bool send_candidate(const std::string& to, const std::string& link, const std::string& candidate, const std::string& mid, bool from_offerer) = 0;
     virtual std::optional<std::vector<IceServer>> ice_servers() = 0;
 };
 
@@ -67,9 +69,10 @@ public:
 
     void connect(std::string url);
     void on_message(MessageHandler handler) override;
+    bool configured() const;
     std::optional<Registration> registration() const;
-    bool send(MessageType type, const std::string& to, const std::string& sdp) override;
-    bool send_candidate(const std::string& to, const std::string& candidate, const std::string& mid) override;
+    bool send(MessageType type, const std::string& to, const std::string& link, const std::string& sdp) override;
+    bool send_candidate(const std::string& to, const std::string& link, const std::string& candidate, const std::string& mid, bool from_offerer) override;
     std::optional<std::vector<IceServer>> ice_servers() override;
 
 private:
