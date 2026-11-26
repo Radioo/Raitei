@@ -8,7 +8,6 @@
 
 #include <spdlog/spdlog.h>
 
-#include <algorithm>
 #include <array>
 #include <memory>
 #include <optional>
@@ -97,11 +96,17 @@ std::int32_t hooked_net_query(std::uint32_t command, void* out, std::int32_t siz
     return iidx::answer_net_query(net_query, tunnel_address(), command, out, size);
 }
 
+enum class Need {
+    always,
+    when_imported,
+};
+
 struct Import {
     const char* dll;
     std::uint32_t ordinal;
     void** original;
     void* detour;
+    Need need = Need::always;
 };
 
 template <typename Function>
@@ -124,33 +129,42 @@ bool install_iidx_hooks(HMODULE game, Tunnel& tunnel, SignalingClient& target_si
         Import{core_module, avs_net_recv, original_of(real.recv), reinterpret_cast<void*>(&net_recv)},
         Import{core_module, avs_net_sendto, original_of(real.sendto), reinterpret_cast<void*>(&net_sendto)},
         Import{core_module, avs_net_recvfrom, original_of(real.recvfrom), reinterpret_cast<void*>(&net_recvfrom)},
-        Import{core_module, avs_net_shutdown, original_of(real.shutdown), reinterpret_cast<void*>(&net_shutdown)},
+        Import{core_module, avs_net_shutdown, original_of(real.shutdown), reinterpret_cast<void*>(&net_shutdown), Need::when_imported},
         Import{core_module, avs_net_close, original_of(real.close), reinterpret_cast<void*>(&net_close)},
         Import{core_module, avs_net_query, original_of(net_query), reinterpret_cast<void*>(&hooked_net_query)},
         Import{ea3_module, ea3_status_query, original_of(status_query), reinterpret_cast<void*>(&hooked_status_query)},
     };
 
     std::vector<void**> slots;
+    bool complete = true;
     for (const auto& import : imports) {
         slots.push_back(find_ordinal_import(game, import.dll, import.ordinal));
-        if (slots.back() == nullptr) {
+        if (slots.back() != nullptr) {
+            continue;
+        }
+        if (import.need == Need::always) {
             spdlog::error("the game does not import ordinal {} from {}", import.ordinal, import.dll);
+            complete = false;
+        } else {
+            spdlog::info("the game does not import ordinal {} from {}, so it never calls it", import.ordinal, import.dll);
         }
     }
-    if (std::ranges::find(slots, nullptr) != slots.end()) {
+    if (!complete) {
         spdlog::error("no import was patched");
         return false;
     }
 
     for (std::size_t index = 0; index < imports.size(); ++index) {
-        *imports[index].original = *slots[index];
+        if (slots[index] != nullptr) {
+            *imports[index].original = *slots[index];
+        }
     }
     network = std::make_unique<iidx::VirtualNetwork>(tunnel, real);
     signaling = &target_signaling;
 
     std::vector<std::size_t> written;
     for (std::size_t index = 0; index < imports.size(); ++index) {
-        if (imports[index].detour == nullptr) {
+        if (imports[index].detour == nullptr || slots[index] == nullptr) {
             continue;
         }
         if (!write_import(slots[index], imports[index].detour)) {
