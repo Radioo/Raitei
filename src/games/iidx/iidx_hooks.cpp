@@ -1,16 +1,14 @@
 #include "iidx_hooks.h"
 
-#include "address_queries.h"
+#include "core/address_queries.h"
 #include "virtual_network.h"
 
 #include "core/import_table.h"
-#include "core/ipv4.h"
 
 #include <spdlog/spdlog.h>
 
 #include <array>
 #include <memory>
-#include <optional>
 #include <vector>
 
 namespace raitei {
@@ -35,8 +33,8 @@ constexpr std::uint32_t avs_net_query = 119;
 constexpr std::uint32_t ea3_status_query = 14;
 
 std::unique_ptr<iidx::VirtualNetwork> network;
-iidx::StatusQuery status_query = nullptr;
-iidx::NetQuery net_query = nullptr;
+StatusQuery status_query = nullptr;
+NetQuery net_query = nullptr;
 SignalingClient* signaling = nullptr;
 
 std::int32_t net_bind(std::int32_t descriptor, std::uint32_t address, std::uint16_t port) {
@@ -83,17 +81,12 @@ std::int32_t net_close(std::int32_t descriptor) {
     return network->close(descriptor);
 }
 
-iidx::TunnelAddress tunnel_address() {
-    const auto self = signaling->registration();
-    return iidx::TunnelAddress{.configured = signaling->configured(), .address = self ? parse_address(self->address) : std::nullopt};
-}
-
 std::int32_t hooked_status_query(std::uint32_t command, const char* path, void* out, std::int32_t size) {
-    return iidx::answer_status_query(status_query, tunnel_address(), command, path, out, size);
+    return answer_status_query(status_query, tunnel_address(*signaling), command, path, out, size);
 }
 
 std::int32_t hooked_net_query(std::uint32_t command, void* out, std::int32_t size) {
-    return iidx::answer_net_query(net_query, tunnel_address(), command, out, size);
+    return answer_net_query(net_query, tunnel_address(*signaling), command, out, size);
 }
 
 enum class Need {

@@ -62,7 +62,8 @@ void start(HMODULE module) {
     }
     for (const auto& game : raitei::supported_games()) {
         const HMODULE game_module = GetModuleHandleW(game.module.data());
-        if (game_module == nullptr) {
+        std::error_code missing;
+        if (game_module == nullptr || (!game.required_file.empty() && !std::filesystem::exists(game.required_file, missing))) {
             continue;
         }
         spdlog::info("hooking {}", game.name);

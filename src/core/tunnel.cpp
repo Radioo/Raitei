@@ -246,8 +246,16 @@ void Tunnel::attach_datagrams(const std::shared_ptr<Peer>& peer, const std::shar
         if (bytes == nullptr || !locked) {
             return;
         }
+        Datagram datagram{locked->remote, to_bytes(*bytes)};
+        {
+            std::scoped_lock handler_lock(datagram_handler_mutex_);
+            if (datagram_handler_) {
+                datagram_handler_(datagram);
+                return;
+            }
+        }
         std::scoped_lock lock(mutex_);
-        datagrams_.push_back(Datagram{locked->remote, to_bytes(*bytes)});
+        datagrams_.push_back(std::move(datagram));
     });
 }
 
@@ -329,6 +337,15 @@ std::optional<std::uint32_t> Tunnel::remote(int handle) const {
         return std::nullopt;
     }
     return found->second->remote;
+}
+
+std::optional<std::string> Tunnel::link(int handle) const {
+    std::scoped_lock lock(mutex_);
+    const auto found = handles_.find(handle);
+    if (found == handles_.end()) {
+        return std::nullopt;
+    }
+    return found->second->link;
 }
 
 LinkState Tunnel::state(int handle) const {
@@ -414,6 +431,11 @@ std::optional<Datagram> Tunnel::receive_datagram() {
     auto datagram = std::move(datagrams_.front());
     datagrams_.pop_front();
     return datagram;
+}
+
+void Tunnel::on_datagram(DatagramHandler handler) {
+    std::scoped_lock lock(datagram_handler_mutex_);
+    datagram_handler_ = std::move(handler);
 }
 
 void Tunnel::answer(std::uint32_t remote, const std::string& link, const std::string& sdp) {

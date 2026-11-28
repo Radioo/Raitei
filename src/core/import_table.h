@@ -8,6 +8,7 @@
 namespace raitei {
 
 void** find_ordinal_import(HMODULE module, std::string_view dll, std::uint32_t ordinal);
+void** find_named_import(HMODULE module, std::string_view dll, std::string_view name);
 bool write_import(void** slot, void* function);
 
 }

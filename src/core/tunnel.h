@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -47,6 +48,8 @@ struct Datagram {
     std::vector<std::uint8_t> bytes;
 };
 
+using DatagramHandler = std::function<void(const Datagram&)>;
+
 class Tunnel {
 public:
     explicit Tunnel(SignalingLink& signaling);
@@ -62,6 +65,7 @@ public:
     void connect(int handle, std::uint32_t remote);
     bool owns(int handle) const;
     std::optional<std::uint32_t> remote(int handle) const;
+    std::optional<std::string> link(int handle) const;
     LinkState state(int handle) const;
     bool send(int handle, std::span<const std::uint8_t> frame);
     Received receive(int handle);
@@ -69,6 +73,7 @@ public:
 
     bool send_datagram(std::uint32_t to, std::span<const std::uint8_t> datagram);
     std::optional<Datagram> receive_datagram();
+    void on_datagram(DatagramHandler handler);
 
 private:
     struct Peer;
@@ -99,6 +104,8 @@ private:
     std::deque<std::shared_ptr<Peer>> released_;
     std::mt19937_64 link_ids_;
     std::deque<Datagram> datagrams_;
+    std::mutex datagram_handler_mutex_;
+    DatagramHandler datagram_handler_;
     std::deque<Message> inbox_;
     std::atomic<std::uint64_t> dropped_datagrams_{0};
     std::jthread thread_;

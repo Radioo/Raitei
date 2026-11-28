@@ -1,6 +1,6 @@
 #include "core/import_table.h"
 #include "core/ipv4.h"
-#include "games/iidx/address_queries.h"
+#include "core/address_queries.h"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -9,7 +9,6 @@
 #include <string>
 
 using namespace raitei;
-using namespace raitei::iidx;
 
 namespace {
 

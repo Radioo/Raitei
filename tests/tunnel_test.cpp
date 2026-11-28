@@ -100,6 +100,30 @@ TEST_CASE("datagrams travel both ways and name their sender") {
     CHECK(at_joiner->bytes == frame(4));
 }
 
+TEST_CASE("a datagram handler gets each datagram in place of the queue") {
+    LoopbackSignaling hub;
+    Cabinet host(hub, "100.64.0.1");
+    Cabinet joiner(hub, "100.64.0.2");
+    std::mutex handled_mutex;
+    std::vector<Datagram> handled;
+    host.tunnel.on_datagram([&](const Datagram& datagram) {
+        std::scoped_lock lock(handled_mutex);
+        handled.push_back(datagram);
+    });
+    link(host, joiner, 0);
+
+    REQUIRE(eventually([&] {
+        joiner.tunnel.send_datagram(host.address, frame(5));
+        std::scoped_lock lock(handled_mutex);
+        return !handled.empty();
+    }));
+    CHECK_FALSE(host.tunnel.receive_datagram().has_value());
+    host.tunnel.on_datagram(nullptr);
+    std::scoped_lock lock(handled_mutex);
+    CHECK(handled.front().from == joiner.address);
+    CHECK(handled.front().bytes == frame(5));
+}
+
 TEST_CASE("a host that keeps sending while the joiner disconnects never throws") {
     LoopbackSignaling hub;
     Cabinet host(hub, "100.64.0.1");

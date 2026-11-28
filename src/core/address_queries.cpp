@@ -7,7 +7,7 @@
 #include <cstring>
 #include <string_view>
 
-namespace raitei::iidx {
+namespace raitei {
 
 namespace {
 
@@ -46,8 +46,17 @@ std::int32_t answer_net_query(NetQuery real, const TunnelAddress& tunnel, std::u
     return write_address(*tunnel.address, out, size);
 }
 
+TunnelAddress tunnel_address(const SignalingClient& signaling) {
+    const auto self = signaling.registration();
+    return TunnelAddress{.configured = signaling.configured(), .address = self ? parse_address(self->address) : std::nullopt};
+}
+
+bool is_global_address_query(std::uint32_t command, const char* path) {
+    return command == facility_ip4_query && path != nullptr && global_address_path == path;
+}
+
 std::int32_t answer_status_query(StatusQuery real, const TunnelAddress& tunnel, std::uint32_t command, const char* path, void* out, std::int32_t size) {
-    if (command != facility_ip4_query || path == nullptr || global_address_path != path || !tunnel.configured) {
+    if (!is_global_address_query(command, path) || !tunnel.configured) {
         return real(command, path, out, size);
     }
     if (!tunnel.address) {

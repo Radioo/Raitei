@@ -44,14 +44,16 @@ find_package(spdlog CONFIG REQUIRED)
 find_package(Catch2 3 CONFIG REQUIRED)
 
 add_library(raitei_core STATIC
+    src/core/address_queries.cpp
     src/core/import_table.cpp
     src/core/ipv4.cpp
     src/core/module_scan.cpp
     src/core/services_hook.cpp
     src/core/signaling.cpp
     src/core/tunnel.cpp
+    src/games/ccj/ccj_hooks.cpp
+    src/games/ccj/unet_bridge.cpp
     src/games/games.cpp
-    src/games/iidx/address_queries.cpp
     src/games/iidx/iidx_hooks.cpp
     src/games/iidx/virtual_network.cpp
     src/games/sdvx/ess_hooks.cpp
@@ -83,6 +85,7 @@ add_executable(raitei_tests
     tests/ipv4_test.cpp
     tests/signaling_test.cpp
     tests/tunnel_test.cpp
+    tests/unet_bridge_test.cpp
     tests/virtual_network_test.cpp
     tests/loopback_signaling.cpp
 )

@@ -13,7 +13,8 @@ namespace {
 
 struct Search {
     std::string_view dll;
-    std::uint32_t ordinal;
+    std::uint32_t ordinal = 0;
+    std::string_view name;
     bool in_dll = false;
     void** slot = nullptr;
 };
@@ -31,9 +32,16 @@ BOOL CALLBACK visit_file(PVOID context, HMODULE, LPCSTR file) {
     return TRUE;
 }
 
-BOOL CALLBACK visit_function(PVOID context, DWORD ordinal, LPCSTR, PVOID* slot) {
+bool wanted(const Search& search, DWORD ordinal, LPCSTR name) {
+    if (search.name.empty()) {
+        return ordinal == search.ordinal;
+    }
+    return name != nullptr && search.name == name;
+}
+
+BOOL CALLBACK visit_function(PVOID context, DWORD ordinal, LPCSTR name, PVOID* slot) {
     auto& search = *static_cast<Search*>(context);
-    if (search.in_dll && slot != nullptr && ordinal == search.ordinal) {
+    if (search.in_dll && slot != nullptr && wanted(search, ordinal, name)) {
         search.slot = reinterpret_cast<void**>(slot);
         return FALSE;
     }
@@ -44,6 +52,12 @@ BOOL CALLBACK visit_function(PVOID context, DWORD ordinal, LPCSTR, PVOID* slot) 
 
 void** find_ordinal_import(HMODULE module, std::string_view dll, std::uint32_t ordinal) {
     Search search{.dll = dll, .ordinal = ordinal};
+    DetourEnumerateImportsEx(module, &search, &visit_file, &visit_function);
+    return search.slot;
+}
+
+void** find_named_import(HMODULE module, std::string_view dll, std::string_view name) {
+    Search search{.dll = dll, .name = name};
     DetourEnumerateImportsEx(module, &search, &visit_file, &visit_function);
     return search.slot;
 }

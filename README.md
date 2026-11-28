@@ -12,6 +12,7 @@ out short-lived TURN credentials.
 Supported: 
 - SOUND VOLTEX 7 and up
 - beatmania IIDX 25 and up
+- CHASE CHASE JOKERS
 
 ## Run
 
