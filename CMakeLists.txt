@@ -37,6 +37,7 @@ configure_file(src/version.rc.in "${CMAKE_BINARY_DIR}/version.rc" @ONLY)
 
 find_package(LibDataChannel CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
+find_package(OpenSSL REQUIRED)
 find_path(DETOURS_INCLUDE_DIR detours/detours.h REQUIRED)
 find_library(DETOURS_LIBRARY detours REQUIRED)
 find_package(safetyhook CONFIG REQUIRED)
@@ -84,11 +85,12 @@ add_executable(raitei_tests
     tests/frames_test.cpp
     tests/ipv4_test.cpp
     tests/signaling_test.cpp
+    tests/signaling_tls_test.cpp
     tests/tunnel_test.cpp
     tests/unet_bridge_test.cpp
     tests/virtual_network_test.cpp
     tests/loopback_signaling.cpp
 )
-target_link_libraries(raitei_tests PRIVATE raitei_core Catch2::Catch2WithMain)
+target_link_libraries(raitei_tests PRIVATE raitei_core Catch2::Catch2WithMain OpenSSL::Crypto)
 include(Catch)
 catch_discover_tests(raitei_tests DISCOVERY_MODE PRE_TEST)

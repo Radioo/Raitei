@@ -1,0 +1,32 @@
+diff -ru a/src/impl/verifiedtlstransport.cpp b/src/impl/verifiedtlstransport.cpp
+--- a/src/impl/verifiedtlstransport.cpp	2026-11-28 11:53:43.302302100 +0100
++++ b/src/impl/verifiedtlstransport.cpp	2026-11-28 11:53:43.373799500 +0100
+@@ -45,6 +45,12 @@
+ 		throw;
+ 	}
+ #else
++#ifdef _WIN32
++	if (!cacert) {
++		openssl::check(SSL_CTX_load_verify_store(mCtx, "org.openssl.winstore://"),
++		               "Failed to load the Windows certificate store");
++	}
++#endif
+ 	if (cacert) {
+ 		if (cacert->find(PemBeginCertificateTag) == string::npos) {
+ 			// *cacert is a file path
+diff -ru a/src/impl/websocket.cpp b/src/impl/websocket.cpp
+--- a/src/impl/websocket.cpp	2026-11-28 11:53:43.256596500 +0100
++++ b/src/impl/websocket.cpp	2026-11-28 11:53:43.372320200 +0100
+@@ -371,12 +371,6 @@
+ 
+ 		bool verify = mHostname.has_value() && !config.disableTlsVerification;
+ 
+-#ifdef _WIN32
+-		if (std::exchange(verify, false)) {
+-			PLOG_WARNING << "TLS certificate verification with root CA is not supported on Windows";
+-		}
+-#endif
+-
+ 		shared_ptr<TlsTransport> transport;
+ 		if (verify)
+ 			transport = std::make_shared<VerifiedTlsTransport>(lower, mHostname.value(),

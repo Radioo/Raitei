@@ -12,6 +12,7 @@
       ]
     },
     "nlohmann-json",
+    "openssl",
     "safetyhook",
     "spdlog"
   ]
